@@ -17,6 +17,16 @@ def get_enrolled_students(grades):
     return sorted(list(students))
 
 
+def _esc(value):
+    """Escape a single user-controlled value for HTML text context."""
+    return escape(str(value))
+
+
+def _esc_attr(value):
+    """Escape a single user-controlled value for a quoted HTML attribute."""
+    return escape(str(value), quote=True)
+
+
 def build_html(grades, output_path="reports/index.html"):
     """Generates an HTML report summarizing student grades and CGPA."""
     out_file = Path(output_path)
@@ -35,7 +45,7 @@ def build_html(grades, output_path="reports/index.html"):
             sem_grades = [g for g in student_grades if g.get("semester", "1") == sem]
             sem_sgpa = sgpa(grades, student_id=sid, semester=sem)
             
-            rows.append(f"<tr class='semester-row'><td colspan='5'>Semester {sem} (SGPA: {sem_sgpa})</td></tr>")
+            rows.append(f"<tr class='semester-row'><td colspan='5'>Semester {_esc(sem)} (SGPA: {_esc(sem_sgpa)})</td></tr>")
             
             for g in sem_grades:
                 grade_char = letter_grade(g["score"], g["max_score"])
@@ -43,8 +53,8 @@ def build_html(grades, output_path="reports/index.html"):
                 # from the unrounded percentage, never from this value.
                 pct = float(percentage(g["score"], g["max_score"])) if g["max_score"] > 0 else 0
                 rows.append(
-                    f"<tr><td>{escape(g['subject'])}</td><td>{g.get('credits', 3.0)}</td><td>{g['score']} / {g['max_score']} ({pct:.1f}%)</td>"
-                    f"<td><span class='badge'>{grade_char}</span></td><td>{g.get('date', '')}</td></tr>"
+                    f"<tr><td>{_esc(g['subject'])}</td><td>{_esc_attr(g.get('credits', 3.0))}</td><td>{_esc(g['score'])} / {_esc(g['max_score'])} ({pct:.1f}%)</td>"
+                    f"<td><span class='badge'>{grade_char}</span></td><td>{_esc(g.get('date', ''))}</td></tr>"
                 )
 
         rows_html = "".join(rows) if rows else "<tr><td colspan='5' class='empty'>No records found</td></tr>"
@@ -52,8 +62,8 @@ def build_html(grades, output_path="reports/index.html"):
         card = f"""
         <div class="card">
             <div class="card-header">
-                <h2>Student: {sid}</h2>
-                <span class="gpa-tag">CGPA: {student_cgpa}</span>
+                <h2>Student: {_esc(sid)}</h2>
+                <span class="gpa-tag">CGPA: {_esc(student_cgpa)}</span>
             </div>
             <table>
                 <thead>
