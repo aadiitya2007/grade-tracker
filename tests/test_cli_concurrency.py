@@ -80,6 +80,56 @@ def _worker_different_assessments(csv_path, subject, result_queue, barrier):
         result_queue.put("ERROR: {!r}".format(exc))
 
 
+def _worker_edit_record(csv_path, result_queue, barrier, score):
+    """Attempt to edit an existing record from an independent process."""
+    try:
+        barrier.wait(timeout=10.0)
+        from grade_tracker.cli import edit_grade
+
+        edit_grade(
+            csv_path=str(csv_path),
+            student_id="S1",
+            semester="1",
+            subject="Mathematics",
+            date="2026-10-06",
+            score=score,
+        )
+        result_queue.put("OK")
+    except ValueError as exc:
+        result_queue.put("VALUEERROR: {}".format(exc))
+    except Exception as exc:  # pragma: no cover - defensive
+        result_queue.put("ERROR: {!r}".format(exc))
+
+
+def _worker_edit_and_add(csv_path, result_queue, barrier, subject):
+    """Edit one record while a sibling process adds a different one."""
+    try:
+        barrier.wait(timeout=10.0)
+        from grade_tracker.cli import edit_grade, save_grade
+
+        edit_grade(
+            csv_path=str(csv_path),
+            student_id="S1",
+            semester="1",
+            subject="Mathematics",
+            date="2026-10-06",
+            score=75.0,
+        )
+        save_grade(
+            student_id="S1",
+            subject=subject,
+            score=25.0,
+            max_score=50.0,
+            date="2026-10-06",
+            credits=3.0,
+            semester="1",
+            csv_path=str(csv_path),
+        )
+        result_queue.put("OK-{}".format(subject))
+    except Exception as exc:  # pragma: no cover - defensive
+        result_queue.put("ERROR: {!r}".format(exc))
+
+
 def _read_rows(csv_path):
     with open(csv_path, newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
@@ -224,6 +274,110 @@ class TestConcurrentGradeWrites(unittest.TestCase):
                 float(row["max_score"])
                 float(row["credits"])
                 int(row["semester"])
+        finally:
+            self._cleanup_files(csv_path)
+
+
+class TestConcurrentEdits(unittest.TestCase):
+    """Multi-process regression tests for concurrent ``edit_grade`` calls."""
+
+    EXPECTED_HEADER = [
+        "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+    ]
+
+    def _seed_csv(self):
+        """Create a temp CSV containing one editable record."""
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".csv", prefix="gedit_", delete=False, encoding="utf-8"
+        )
+        handle.close()
+        with open(handle.name, "w", encoding="utf-8", newline="") as fh:
+            fh.write(",".join(self.EXPECTED_HEADER) + "\n")
+            fh.write("S1,Mathematics,50,100,2026-10-06,3,1\n")
+        return handle.name
+
+    def _cleanup_files(self, csv_path):
+        if csv_path:
+            from grade_tracker.cli import _lock_path_for
+            Path(_lock_path_for(csv_path)).unlink(missing_ok=True)
+            Path(csv_path).unlink(missing_ok=True)
+
+    def _join_children_and_collect_results(self, children, result_queue):
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline and any(p.is_alive() for p in children):
+            for p in children:
+                if p.is_alive():
+                    p.join(timeout=max(0.1, deadline - time.monotonic()))
+        if any(p.is_alive() for p in children):
+            for p in children:
+                p.terminate()
+            self.fail("concurrent editors did not finish within the timeout")
+        results = []
+        while not result_queue.empty():
+            try:
+                results.append(result_queue.get_nowait())
+            except Exception:
+                break
+        return results
+
+    def _run_workers(self, target, csv_path, *extra_args):
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(2)
+        result_queue = ctx.Queue()
+        children = []
+        for arg in extra_args:
+            proc = ctx.Process(
+                target=target, args=(csv_path, result_queue, barrier, arg)
+            )
+            proc.start()
+            children.append(proc)
+        return self._join_children_and_collect_results(children, result_queue)
+
+    def test_concurrent_edits_of_same_record_no_lost_update(self):
+        """Two processes editing the same record serialize without data loss."""
+        csv_path = self._seed_csv()
+        try:
+            results = self._run_workers(_worker_edit_record, csv_path, 60.0, 70.0)
+            self.assertEqual(len(results), 2, "expected 2 worker results: {!r}".format(results))
+            oks = [r for r in results if r == "OK"]
+            self.assertEqual(
+                len(oks), 2,
+                "both edits should serialize cleanly, got {!r}".format(results),
+            )
+            rows = _read_rows(csv_path)
+            self.assertEqual(len(rows), 1, "exactly one record should remain")
+            self.assertEqual(
+                list(rows[0].keys()), self.EXPECTED_HEADER, "header/column order preserved"
+            )
+            # The last writer wins; the file must be one of the two scores,
+            # never a torn/mixed row.
+            self.assertIn(rows[0]["score"], {"60.0", "70.0"})
+            self.assertEqual(rows[0]["max_score"], "100")
+            self.assertEqual(rows[0]["subject"], "Mathematics")
+        finally:
+            self._cleanup_files(csv_path)
+
+    def test_concurrent_edit_and_add_produce_both_records(self):
+        """An edit and an independent add from two processes both land."""
+        csv_path = self._seed_csv()
+        try:
+            results = self._run_workers(
+                _worker_edit_and_add, csv_path, "Physics", "Chemistry"
+            )
+            self.assertEqual(len(results), 2, "expected 2 worker results: {!r}".format(results))
+            self.assertEqual(
+                sorted(results), ["OK-Chemistry", "OK-Physics"],
+                "workers misbehaved: {!r}".format(results),
+            )
+            rows = _read_rows(csv_path)
+            self.assertEqual(
+                list(rows[0].keys()), self.EXPECTED_HEADER, "header/column order preserved"
+            )
+            subjects = {row["subject"] for row in rows}
+            self.assertEqual(subjects, {"Mathematics", "Physics", "Chemistry"})
+            edited = [r for r in rows if r["subject"] == "Mathematics"]
+            self.assertEqual(len(edited), 1)
+            self.assertEqual(edited[0]["score"], "75.0")
         finally:
             self._cleanup_files(csv_path)
 
