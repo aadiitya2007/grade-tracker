@@ -257,6 +257,88 @@ def assessment_key(student_id, semester, subject, date):
     )
 
 
+def _read_existing_rows(path):
+    """Read the raw CSV rows (without the header) from ``path``.
+
+    Returns ``(file_exists, rows)``.  When the file exists, its header is
+    validated against the canonical schema; an unexpected schema raises
+    ``ValueError`` and the file is left untouched (matching ``save_grade``'s
+    documented refusal to rewrite a file it does not understand).
+
+    Raw rows (not ``load_grades`` dicts) are returned so that unrelated
+    records — including legacy rows the loader would skip — are preserved
+    on rewrite instead of being normalized or dropped.
+    """
+    path = Path(path)
+    if not path.exists():
+        return False, []
+
+    with open(path, mode="r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        # Preserve the expected header/column order.  An existing file
+        # with an unexpected schema is left untouched rather than
+        # silently rewritten into the canonical shape.
+        expected_header = [
+            "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+        ]
+        if header is not None and header != expected_header:
+            raise ValueError(
+                "grades file has an unexpected schema; refusing to rewrite "
+                f"{path} (expected header {expected_header!r}, got {header!r})"
+            )
+        if header is None:
+            return True, []
+        return True, list(reader)
+
+
+def _atomic_write_rows(path, rows):
+    """Write ``rows`` (data records, no header) to ``path`` atomically.
+
+    Writes to a temporary file in the same directory, flushes and ``fsync``\\ s
+    it, then ``os.replace``\\ s it over the target.  On any failure before the
+    replace succeeds the original file is left byte-for-byte unchanged and the
+    temporary file is removed.  Callers must hold the inter-process lock.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".grades-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                ["student_id", "subject", "score", "max_score", "date", "credits", "semester"]
+            )
+            for row in rows:
+                writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Atomically replace the target CSV.
+        os.replace(tmp_name, path)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _append_row(path, row):
+    """Append one raw CSV row to ``path`` using atomic persistence.
+
+    Shared by ``save_grade`` and ``edit_grade``; both callers must already
+    hold the inter-process lock for ``path``.  The file is created (with the
+    canonical header) if it does not exist.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _, existing_rows = _read_existing_rows(path)
+    _atomic_write_rows(path, list(existing_rows) + [row])
+
+
 def save_grade(
     student_id,
     subject,
@@ -299,56 +381,183 @@ def save_grade(
                     f"in {subject} (semester {semester}) on {date}"
                 )
 
-        # Build the updated CSV contents and write atomically.
-        # Read the current CSV (if any) and combine it with the new row.
-        path = Path(csv_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        existing_rows = []
-        file_exists = path.exists()
-        if file_exists:
-            with open(path, mode="r", encoding="utf-8", newline="") as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                # Preserve the expected header/column order.  An existing file
-                # with an unexpected schema is left untouched rather than
-                # silently rewritten into the canonical shape.
-                expected_header = [
-                    "student_id", "subject", "score", "max_score", "date", "credits", "semester"
-                ]
-                if header is not None and header != expected_header:
-                    raise ValueError(
-                        "grades file has an unexpected schema; refusing to rewrite "
-                        f"{path} (expected header {expected_header!r}, got {header!r})"
-                    )
-                if header is not None:
-                    existing_rows = list(reader)
-
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".grades-", suffix=".tmp"
+        # Build the updated CSV contents and write atomically.  ``_append_row``
+        # performs the schema check and the temp-file/fsync/replace sequence
+        # while this transaction still holds the lock.
+        _append_row(
+            csv_path,
+            [student_id, subject, score, max_score, date, credits, semester],
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    ["student_id", "subject", "score", "max_score", "date", "credits", "semester"]
-                )
-                for row in existing_rows:
-                    writer.writerow(row)
-                writer.writerow(
-                    [student_id, subject, score, max_score, date, credits, semester]
-                )
-                f.flush()
-                os.fsync(f.fileno())
 
-            # Atomically replace the target CSV.
-            os.replace(tmp_name, path)
-            tmp_name = None
-        finally:
-            if tmp_name is not None:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
+
+def edit_grade(
+    csv_path,
+    student_id,
+    semester,
+    subject,
+    date,
+    score=None,
+    max_score=None,
+    credits=None,
+    new_student_id=None,
+    new_semester=None,
+    new_subject=None,
+    new_date=None,
+):
+    """Edit one existing grade row in ``csv_path`` as a single transaction.
+
+    The target record is identified by its current assessment identity
+    ``(student_id, semester, subject, date)``.  Any change option left as
+    ``None`` keeps the record's existing value — omitted options are never
+    replaced with defaults.
+
+    The whole update runs as one locked transaction:
+
+    1. Acquire the cross-process lock for the destination CSV.
+    2. Read the latest persisted rows while holding the lock.
+    3. Resolve the target uniquely by ``grade_tracker.calc.assessment_key``.
+    4. Apply the requested changes in memory.
+    5. Validate the complete updated record with ``validate_grade``.
+    6. Reject the edit if the resulting identity duplicates another record
+       (the target itself is excluded, so retakes are unaffected).
+    7. Write the complete CSV to a temp file in the same directory, flush and
+       ``fsync`` it, then ``os.replace`` it over the original.
+    8. Release the lock reliably (context manager), including on exceptions.
+
+    ``edit_grade`` and ``save_grade`` never call each other, and only these
+    public entry points acquire the lock, so the transaction never
+    re-acquires the lock it already holds.
+
+    Raises:
+        ValueError: If the grades file has an unexpected schema, no record
+            matches the target, several records match (ambiguous), the update
+            fails validation, or the updated identity would duplicate another
+            record.  The file is left unchanged in every error case — any
+            failure before the atomic replace leaves the original bytes intact
+            and removes the temporary file.
+    """
+    path = Path(csv_path)
+    changes = {
+        "score": score,
+        "max_score": max_score,
+        "credits": credits,
+        "student_id": new_student_id,
+        "semester": new_semester,
+        "subject": new_subject,
+        "date": new_date,
+    }
+    if all(value is None for value in changes.values()):
+        raise ValueError("no changes requested")
+
+    target_key = assessment_key(student_id, semester, subject, date)
+
+    header = [
+        "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+    ]
+    index_of = {name: position for position, name in enumerate(header)}
+
+    def cell(row, name):
+        position = index_of[name]
+        if position >= len(row):
+            return None
+        return row[position]
+
+    def row_key(row):
+        return assessment_key(
+            cell(row, "student_id") or "",
+            cell(row, "semester") or "",
+            cell(row, "subject") or "",
+            cell(row, "date") or "",
+        )
+
+    lock_file = _lock_path_for(csv_path)
+    with _InterProcessLock(lock_file) as _lock:
+        # Read the latest persisted rows while holding the lock.
+        _, rows = _read_existing_rows(path)
+
+        # Resolve the target record by its authoritative assessment identity.
+        # Raw rows are matched positionally so unrelated records — including
+        # legacy rows load_grades would skip — stay untouched.
+        matches = [
+            position
+            for position, row in enumerate(rows)
+            if _row_has_visible_content(row) and row_key(row) == target_key
+        ]
+
+        if not matches:
+            raise ValueError(
+                f"no record found for student '{student_id}' (semester {semester}) "
+                f"in {subject} on {date}"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"ambiguous target: {len(matches)} records match student "
+                f"'{student_id}' (semester {semester}) in {subject} on {date}; "
+                "the file contains duplicate assessments — repair it with "
+                "'validate' before editing"
+            )
+
+        target_position = matches[0]
+        target_row = list(rows[target_position])
+
+        def current(name, default):
+            value = cell(target_row, name)
+            if value is None or value == "":
+                return default
+            return value
+
+        # Apply the requested changes in memory; omitted fields keep their
+        # existing raw values and are never silently defaulted.  Numeric
+        # changes are stored as the caller-supplied floats, matching
+        # save_grade's serialization of add-command values.
+        updated = {
+            "student_id": new_student_id if new_student_id is not None else current("student_id", ""),
+            "semester": new_semester if new_semester is not None else current("semester", "1"),
+            "subject": new_subject if new_subject is not None else current("subject", ""),
+            "date": new_date if new_date is not None else current("date", ""),
+            "score": score if score is not None else current("score", "0"),
+            "max_score": max_score if max_score is not None else current("max_score", "0"),
+            "credits": credits if credits is not None else current("credits", "3.0"),
+        }
+
+        # Validate the complete updated record with the existing rules.
+        validate_grade(
+            float(updated["score"]), float(updated["max_score"]), updated["date"]
+        )
+
+        # The resulting identity must not collide with any *other* record;
+        # the target itself is excluded so retakes and other legitimate
+        # duplicates targeting the same row remain unaffected.
+        new_key = assessment_key(
+            updated["student_id"], updated["semester"], updated["subject"], updated["date"]
+        )
+        for position, row in enumerate(rows):
+            if position == target_position or not _row_has_visible_content(row):
+                continue
+            other_key = row_key(row)
+            if other_key is not None and other_key == new_key:
+                raise ValueError(
+                    "assessment already exists for student "
+                    f"'{updated['student_id']}' in {updated['subject']} "
+                    f"(semester {updated['semester']}) on {updated['date']}"
+                )
+
+        # Rewrite only the target row; every other raw row is preserved as-is
+        # (header, column order, and legacy rows are untouched).
+        rows[target_position] = [str(updated[name]) for name in header]
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _atomic_write_rows(path, rows)
+        except ValueError:
+            # Schema refusal from a racing rewrite; already a user-facing error.
+            raise
+        except OSError as exc:
+            # Any I/O failure before os.replace completes leaves the original
+            # CSV untouched (the temp file is removed by _atomic_write_rows).
+            raise ValueError(f"failed to write {path}: {exc}") from exc
+
+
 def _row_has_visible_content(row):
     """True when a parsed CSV record contains at least one non-blank cell."""
     return any(cell.strip() for cell in row)
@@ -711,6 +920,50 @@ def cmd_add(args):
     print(f"Added grade for {args.student_id} in {args.subject}.")
 
 
+def cmd_edit(args):
+    """Edit one existing grade record as a single locked transaction."""
+    changes = {
+        "score": args.score,
+        "max_score": args.max_score,
+        "credits": args.credits,
+        "student_id": args.new_student_id,
+        "semester": args.new_semester,
+        "subject": args.new_subject,
+        "date": args.new_date,
+    }
+    if all(value is None for value in changes.values()):
+        print(
+            "Error: no changes requested; pass at least one of "
+            "--score, --max-score, --credits, --student-id, --semester, "
+            "--subject, --date",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    try:
+        edit_grade(
+            csv_path=args.data,
+            student_id=args.student_id,
+            semester=args.semester,
+            subject=args.subject,
+            date=args.date,
+            score=args.score,
+            max_score=args.max_score,
+            credits=args.credits,
+            new_student_id=args.new_student_id,
+            new_semester=args.new_semester,
+            new_subject=args.new_subject,
+            new_date=args.new_date,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    print(
+        f"Edited grade for {args.student_id} in {args.subject} "
+        f"(semester {args.semester}) on {args.date}."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
     parser.add_argument("--data", default=DEFAULT_DATA_PATH, help="Path to grades.csv")
@@ -745,6 +998,55 @@ def main():
     p_add.add_argument("credits", type=float, help="Credits for the subject")
     p_add.add_argument("semester", help="Semester number")
     p_add.set_defaults(func=cmd_add)
+
+    # edit
+    p_edit = subparsers.add_parser(
+        "edit",
+        help="Edit an existing grade record",
+        description=(
+            "Edit an existing grade record. The target record is identified "
+            "by its current assessment identity: STUDENT_ID, SEMESTER, "
+            "SUBJECT, and DATE. Omitted change options keep the record's "
+            "current value; at least one change option is required. The edit "
+            "is applied as a single transaction under the same cross-process "
+            "lock and atomic write used by 'add'. If the target does not "
+            "exist, or several records match it, the command fails and the "
+            "file is left unchanged."
+        ),
+    )
+    p_edit.add_argument("student_id", help="Student ID of the record to edit")
+    p_edit.add_argument("semester", help="Semester of the record to edit")
+    p_edit.add_argument("subject", help="Subject of the record to edit")
+    p_edit.add_argument("date", help="Date of the record to edit (YYYY-MM-DD)")
+    p_edit.add_argument(
+        "--score", type=float, default=None,
+        help="New score (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--max-score", dest="max_score", type=float, default=None,
+        help="New maximum score (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--credits", type=float, default=None,
+        help="New credits (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--student-id", dest="new_student_id", default=None,
+        help="New student ID (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--semester", dest="new_semester", default=None,
+        help="New semester (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--subject", dest="new_subject", default=None,
+        help="New subject (omit to keep the current value)",
+    )
+    p_edit.add_argument(
+        "--date", dest="new_date", default=None,
+        help="New date, YYYY-MM-DD (omit to keep the current value)",
+    )
+    p_edit.set_defaults(func=cmd_edit)
 
     # validate
     p_validate = subparsers.add_parser(
