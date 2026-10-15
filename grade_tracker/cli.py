@@ -8,7 +8,9 @@ import re
 import sys
 import tempfile
 import time
-from datetime import date
+from datetime import date, datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 
 from grade_tracker.calc import (
@@ -23,6 +25,17 @@ from grade_tracker.calc import (
 from grade_tracker.export import build_html
 
 DEFAULT_DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "grades.csv"
+BACKUP_FORMAT_VERSION = "1.0"
+SUPPORTED_CSV_SCHEMA_VERSION = "1.0"
+CANONICAL_COLUMNS = [
+    "student_id",
+    "subject",
+    "score",
+    "max_score",
+    "date",
+    "credits",
+    "semester",
+]
 
 
 
@@ -964,6 +977,314 @@ def cmd_edit(args):
     )
 
 
+def compute_sha256(path):
+    """Compute hex SHA-256 digest of file at path."""
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(65536):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def create_backup(csv_path=DEFAULT_DATA_PATH, backup_dir=None):
+    """Create a verified, timestamped backup of csv_path with metadata manifest.
+
+    Coordinated under the inter-process lock of the source CSV.
+    The source CSV must exist and pass integrity audit (audit_grades_csv).
+    Returns a dict with paths and metadata:
+        {
+            "backup_csv": Path,
+            "manifest": Path,
+            "metadata": dict,
+        }
+    """
+    source = Path(csv_path).resolve()
+    lock_file = _lock_path_for(source)
+
+    with _InterProcessLock(lock_file):
+        if not source.exists():
+            raise FileNotFoundError(f"source data file does not exist: {source}")
+        if not source.is_file():
+            raise ValueError(f"source path is not a regular file: {source}")
+
+        # Check source validity before creating backup
+        diagnostics = audit_grades_csv(source)
+        if diagnostics:
+            raise ValueError(
+                f"cannot backup invalid source CSV ({len(diagnostics)} validation problems found)"
+            )
+
+        if backup_dir is None:
+            dest_dir = source.parent / "backups"
+        else:
+            dest_dir = Path(backup_dir).resolve()
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        base_timestamp = now.strftime("%Y%m%dT%H%M%SZ")
+
+        # Guarantee unique name even if created rapidly
+        counter = 0
+        while True:
+            suffix = f"-{counter}" if counter > 0 else ""
+            candidate_base = f"grades-{base_timestamp}{suffix}"
+            candidate_csv = dest_dir / f"{candidate_base}.csv"
+            candidate_json = dest_dir / f"{candidate_base}.json"
+            if not candidate_csv.exists() and not candidate_json.exists():
+                backup_csv_path = candidate_csv
+                manifest_path = candidate_json
+                break
+            counter += 1
+
+        # Read source bytes and compute checksum
+        with open(source, "rb") as f:
+            data_bytes = f.read()
+
+        data_checksum = hashlib.sha256(data_bytes).hexdigest()
+        byte_size = len(data_bytes)
+
+        # Count records and extract header
+        with open(source, mode="r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            record_count = sum(1 for row in reader if _row_has_visible_content(row))
+
+        metadata = {
+            "format_version": BACKUP_FORMAT_VERSION,
+            "schema_version": SUPPORTED_CSV_SCHEMA_VERSION,
+            "created_at": now.isoformat(),
+            "source_file": source.name,
+            "sha256": data_checksum,
+            "bytes": byte_size,
+            "records": record_count,
+            "header": header,
+        }
+
+        # Write to temporary files in dest_dir then atomically replace
+        tmp_csv = None
+        tmp_json = None
+        try:
+            fd_csv, tmp_csv = tempfile.mkstemp(
+                dir=str(dest_dir), prefix=".backup-csv-", suffix=".tmp"
+            )
+            with os.fdopen(fd_csv, "wb") as f:
+                f.write(data_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+
+            fd_json, tmp_json = tempfile.mkstemp(
+                dir=str(dest_dir), prefix=".backup-meta-", suffix=".tmp"
+            )
+            with os.fdopen(fd_json, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Atomically place both files (CSV first, then manifest)
+            os.replace(tmp_csv, backup_csv_path)
+            tmp_csv = None
+            os.replace(tmp_json, manifest_path)
+            tmp_json = None
+
+        finally:
+            if tmp_csv is not None:
+                try:
+                    os.unlink(tmp_csv)
+                except OSError:
+                    pass
+            if tmp_json is not None:
+                try:
+                    os.unlink(tmp_json)
+                except OSError:
+                    pass
+
+        return {
+            "backup_csv": backup_csv_path,
+            "manifest": manifest_path,
+            "metadata": metadata,
+        }
+
+
+def restore_backup(backup_path, dest_path=DEFAULT_DATA_PATH):
+    """Restore a verified backup to dest_path.
+
+    backup_path may point to either the backup CSV or its companion .json manifest.
+    Coordinated under the inter-process lock of dest_path.
+    Destination is preserved byte-for-byte if any check or step fails.
+    """
+    b_path = Path(backup_path).resolve()
+    if not b_path.exists():
+        raise FileNotFoundError(f"backup path does not exist: {b_path}")
+
+    if b_path.suffix.lower() == ".json":
+        manifest_path = b_path
+        backup_csv_path = b_path.with_suffix(".csv")
+    elif b_path.suffix.lower() == ".csv":
+        backup_csv_path = b_path
+        manifest_path = b_path.with_suffix(".json")
+    else:
+        raise ValueError(
+            f"unsupported backup file extension: {b_path.suffix} (expected .csv or .json)"
+        )
+
+    if not backup_csv_path.exists():
+        raise FileNotFoundError(f"backup data file not found: {backup_csv_path}")
+    if not backup_csv_path.is_file():
+        raise ValueError(f"backup data path is not a regular file: {backup_csv_path}")
+
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"backup manifest file not found: {manifest_path}")
+    if not manifest_path.is_file():
+        raise ValueError(f"backup manifest path is not a regular file: {manifest_path}")
+
+    dest = Path(dest_path).resolve()
+
+    # Prevent restoring over the backup itself or its manifest
+    if dest == backup_csv_path or dest == manifest_path:
+        raise ValueError("destination cannot be the backup file or its manifest")
+
+    # Read and validate manifest
+    try:
+        with open(manifest_path, mode="r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed backup manifest: {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"cannot read backup manifest: {exc}") from exc
+
+    if not isinstance(manifest_data, dict):
+        raise ValueError("malformed backup manifest: root must be a JSON object")
+
+    format_version = manifest_data.get("format_version")
+    if format_version != BACKUP_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported backup format version: {format_version!r} "
+            f"(supported: {BACKUP_FORMAT_VERSION!r})"
+        )
+
+    schema_version = manifest_data.get("schema_version")
+    if schema_version != SUPPORTED_CSV_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported backup schema version: {schema_version!r} "
+            f"(supported: {SUPPORTED_CSV_SCHEMA_VERSION!r})"
+        )
+
+    expected_sha256 = manifest_data.get("sha256")
+    if not expected_sha256 or not isinstance(expected_sha256, str):
+        raise ValueError("backup manifest missing valid sha256 checksum")
+
+    # Verify SHA-256 checksum of the backup data file
+    actual_sha256 = compute_sha256(backup_csv_path)
+    if actual_sha256.lower() != expected_sha256.lower():
+        raise ValueError(
+            f"checksum mismatch: expected {expected_sha256}, got {actual_sha256}"
+        )
+
+    # Validate header in manifest if present
+    manifest_header = manifest_data.get("header")
+    if manifest_header is not None:
+        if not isinstance(manifest_header, list):
+            raise ValueError("malformed backup manifest: header must be a list")
+        # Ensure required canonical columns are present
+        required_cols = ["student_id", "subject", "score", "max_score", "date"]
+        missing_req = [c for c in required_cols if c not in manifest_header]
+        if missing_req:
+            raise ValueError(
+                f"backup manifest header missing required column(s): {', '.join(missing_req)}"
+            )
+
+    # Validate CSV content and records using audit_grades_csv
+    diagnostics = audit_grades_csv(backup_csv_path)
+    if diagnostics:
+        detail = diagnostics[0] if len(diagnostics) == 1 else f"{len(diagnostics)} problems found (first: {diagnostics[0]})"
+        raise ValueError(f"backup CSV validation failed: {detail}")
+
+    # Now acquire the lock for destination and re-verify everything before replacing
+    dest_lock = _lock_path_for(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    with _InterProcessLock(dest_lock):
+        # Re-check collision with backup paths while holding lock
+        if dest.resolve() == backup_csv_path.resolve() or dest.resolve() == manifest_path.resolve():
+            raise ValueError("destination cannot be the backup file or its manifest")
+
+        # Read backup data bytes
+        with open(backup_csv_path, "rb") as f:
+            restored_bytes = f.read()
+
+        # Re-verify checksum under lock
+        if hashlib.sha256(restored_bytes).hexdigest().lower() != expected_sha256.lower():
+            raise ValueError("backup file was modified during restore")
+
+        # Write to temporary file in destination directory
+        tmp_name = None
+        try:
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(dest.parent), prefix=".grades-restore-", suffix=".tmp"
+            )
+            with os.fdopen(fd, "wb") as f:
+                f.write(restored_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Atomically replace destination
+            os.replace(tmp_name, dest)
+            tmp_name = None
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+    return {
+        "restored_path": dest,
+        "backup_csv": backup_csv_path,
+        "manifest": manifest_path,
+        "records": manifest_data.get("records"),
+        "sha256": actual_sha256,
+    }
+
+
+def cmd_backup(args):
+    """Create a verified, timestamped backup of the current grade data."""
+    try:
+        result = create_backup(csv_path=args.data)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    meta = result["metadata"]
+    print(
+        f"Backup created successfully:\n"
+        f"  Data: {result['backup_csv']}\n"
+        f"  Manifest: {result['manifest']}\n"
+        f"  Records: {meta['records']}\n"
+        f"  SHA-256: {meta['sha256']}\n"
+        f"  Status: verified"
+    )
+    raise SystemExit(0)
+
+
+def cmd_restore(args):
+    """Restore a verified backup to the destination grade data."""
+    try:
+        result = restore_backup(backup_path=args.backup_path, dest_path=args.data)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    print(
+        f"Restore completed successfully:\n"
+        f"  Source: {result['backup_csv']}\n"
+        f"  Destination: {result['restored_path']}\n"
+        f"  SHA-256: {result['sha256']}\n"
+        f"  Status: verified"
+    )
+    raise SystemExit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grade Tracker CLI")
     parser.add_argument("--data", default=DEFAULT_DATA_PATH, help="Path to grades.csv")
@@ -1053,6 +1374,19 @@ def main():
         "validate", help="Audit the grades CSV for integrity problems (read-only)"
     )
     p_validate.set_defaults(func=cmd_validate)
+
+    # backup
+    p_backup = subparsers.add_parser(
+        "backup", help="Create a verified, timestamped backup of the grade data"
+    )
+    p_backup.set_defaults(func=cmd_backup)
+
+    # restore
+    p_restore = subparsers.add_parser(
+        "restore", help="Restore a verified backup to the grade data file"
+    )
+    p_restore.add_argument("backup_path", help="Path to backup CSV or JSON manifest")
+    p_restore.set_defaults(func=cmd_restore)
 
     args = parser.parse_args()
     if not args.command:
