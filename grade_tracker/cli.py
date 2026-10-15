@@ -584,40 +584,36 @@ def _format_value_for_display(raw_value):
     return repr(text)
 
 
-def audit_grades_csv(csv_path):
-    """Audit the grades CSV without modifying it.
+def _audit_grades_csv_records(csv_path, collect_records=False):
+    """Audit the grades CSV without modifying it, optionally collecting valid records.
 
     ``csv_path`` may be a ``Path`` or a string. The file is opened read-only
-    and is never rewritten, normalised, repaired, or deleted. Diagnostics use
-    the CSV record numbers reported by :mod:`csv`: the header is row 1 and the
-    first data record is row 2. Records that ``load_grades`` would silently
-    skip (blank ``student_id``/subject/credits/semester, unparsable
-    ``score``/``max_score``) are flagged here instead of being dropped, so a
-    file that parses cleanly can still produce an audit report.
-
-    ``credits`` and ``semester`` may legitimately be omitted by legacy rows:
-    the loader falls back to ``3.0`` and ``"1"`` respectively, so only blank
-    or non-numeric credit values (and blank semester values) are flagged here.
-    ``date`` has no fallback and is always required.
+    and is never rewritten, normalised, repaired, or deleted.
 
     Returns:
-        list[str]: one human-readable diagnostic per detected problem.
+        tuple[list[str], list[dict], dict]:
+            - diagnostics: list of error strings
+            - valid_records: list of dicts with canonical schema keys
+              (only populated if collect_records=True and no row-level errors)
+            - intra_duplicates: list of dicts with details of in-file duplicates
     """
     path = Path(csv_path)
 
     if not path.exists():
-        return [f"{path}: file not found; nothing to audit"]
+        return [f"{path}: file not found; nothing to audit"], [], []
 
     if not path.is_file():
-        return [f"{path}: not a regular file"]
+        return [f"{path}: not a regular file"], [], []
 
     try:
         if path.stat().st_size == 0:
-            return [f"{path}: file is empty (no CSV header or records)"]
+            return [f"{path}: file is empty (no CSV header or records)"], [], []
     except OSError as exc:
-        return [f"{path}: cannot read file ({exc})"]
+        return [f"{path}: cannot read file ({exc})"], [], []
 
     diagnostics = []
+    valid_records = []
+    intra_duplicates = []
 
     try:
         with open(path, mode="r", encoding="utf-8", newline="") as handle:
@@ -626,20 +622,17 @@ def audit_grades_csv(csv_path):
             try:
                 header = next(reader, None)
             except UnicodeDecodeError as exc:
-                return [f"{path}: file is not valid UTF-8 text ({exc})"]
+                return [f"{path}: file is not valid UTF-8 text ({exc})"], [], []
 
             if header is None:
-                return [f"{path}: file is empty (no CSV header or records)"]
+                return [f"{path}: file is empty (no CSV header or records)"], [], []
 
             if not _row_has_visible_content(header):
-                return [f"{path}: row 1: CSV header is blank; expected the grades schema"]
+                return [f"{path}: row 1: CSV header is blank; expected the grades schema"], [], []
 
             expected_columns = [
                 "student_id", "subject", "score", "max_score", "date", "credits", "semester"
             ]
-            # credits and semester are optional columns: load_grades falls
-            # back to 3.0 credits and semester "1" when they are absent, so
-            # legacy files that omit them entirely remain valid.
             optional_columns = {"credits", "semester"}
             required_columns = [
                 name for name in expected_columns if name not in optional_columns
@@ -682,8 +675,6 @@ def audit_grades_csv(csv_path):
                 row_number += 1
 
                 if not raw_row:
-                    # csv.reader never yields truly empty records for blank
-                    # lines (they are skipped), so this is only a guard.
                     continue
 
                 if not _row_has_visible_content(raw_row):
@@ -739,13 +730,12 @@ def audit_grades_csv(csv_path):
                         )
 
                 if record["semester"] is None or record["semester"] == "":
-                    # A missing semester column is a valid legacy schema (the
-                    # loader defaults to "1"), but a semester column that is
-                    # present yet blank in this row is not loadable as-is.
                     if "semester" in index_of:
                         diagnostics.append(
                             f"row {row_number}, field semester: missing or blank semester"
                         )
+                    else:
+                        record["semester"] = "1"
 
                 score = None
                 if record["score"] is None or record["score"] == "":
@@ -803,8 +793,8 @@ def audit_grades_csv(csv_path):
 
                 if record["credits"] is not None and record["credits"] != "":
                     try:
-                        credits = float(record["credits"])
-                        if not math.isfinite(credits):
+                        credits_val = float(record["credits"])
+                        if not math.isfinite(credits_val):
                             raise ValueError
                     except ValueError:
                         diagnostics.append(
@@ -812,8 +802,8 @@ def audit_grades_csv(csv_path):
                             f"{_format_value_for_display(record['credits'])} "
                             "is not a numeric credit value"
                         )
-                # An absent credits cell is valid: load_grades falls back to
-                # the default of 3.0, so legacy rows without credits are kept.
+                else:
+                    record["credits"] = "3.0"
 
                 row_has_error = any(
                     message.startswith(f"row {row_number} ")
@@ -821,9 +811,6 @@ def audit_grades_csv(csv_path):
                     for message in diagnostics
                 )
                 if not row_has_error:
-                    # Only rows whose identity fields are all usable can
-                    # produce a duplicate-assessment diagnostic; the identity
-                    # itself is the authoritative calc.assessment_key.
                     key = calc_assessment_key(
                         {
                             "student_id": record["student_id"],
@@ -836,22 +823,236 @@ def audit_grades_csv(csv_path):
                         first_row = seen_assessments.get(key)
                         if first_row is None:
                             seen_assessments[key] = row_number
+                            if collect_records:
+                                valid_records.append(
+                                    {
+                                        "row_number": row_number,
+                                        "key": key,
+                                        "record": record,
+                                    }
+                                )
                         else:
-                            diagnostics.append(
+                            diag = (
                                 f"row {row_number}: duplicate assessment of row {first_row} "
                                 f"(student_id {record['student_id']!r}, "
                                 f"semester {record['semester']!r}, "
                                 f"subject {record['subject']!r}, "
                                 f"date {record['date']!r})"
                             )
+                            diagnostics.append(diag)
+                            intra_duplicates.append(
+                                {
+                                    "row_number": row_number,
+                                    "first_row": first_row,
+                                    "key": key,
+                                    "record": record,
+                                    "diagnostic": diag,
+                                }
+                            )
     except UnicodeDecodeError as exc:
-        return [f"{path}: file is not valid UTF-8 text ({exc})"]
+        return [f"{path}: file is not valid UTF-8 text ({exc})"], [], []
     except OSError as exc:
-        return [f"{path}: cannot read file ({exc})"]
+        return [f"{path}: cannot read file ({exc})"], [], []
     except csv.Error as exc:
-        return [f"{path}: malformed CSV ({exc})"]
+        return [f"{path}: malformed CSV ({exc})"], [], []
 
+    return diagnostics, valid_records, intra_duplicates
+
+
+def audit_grades_csv(csv_path):
+    """Audit the grades CSV without modifying it.
+
+    ``csv_path`` may be a ``Path`` or a string. The file is opened read-only
+    and is never rewritten, normalised, repaired, or deleted. Diagnostics use
+    the CSV record numbers reported by :mod:`csv`: the header is row 1 and the
+    first data record is row 2. Records that ``load_grades`` would silently
+    skip (blank ``student_id``/subject/credits/semester, unparsable
+    ``score``/``max_score``) are flagged here instead of being dropped, so a
+    file that parses cleanly can still produce an audit report.
+
+    ``credits`` and ``semester`` may legitimately be omitted by legacy rows:
+    the loader falls back to ``3.0`` and ``"1"`` respectively, so only blank
+    or non-numeric credit values (and blank semester values) are flagged here.
+    ``date`` has no fallback and is always required.
+
+    Returns:
+        list[str]: one human-readable diagnostic per detected problem.
+    """
+    diagnostics, _, _ = _audit_grades_csv_records(csv_path, collect_records=False)
     return diagnostics
+
+
+class ImportResult:
+    """Outcome of a completed (committed) import transaction."""
+
+    def __init__(self, imported, skipped, considered):
+        self.imported = imported
+        self.skipped = skipped
+        self.considered = considered
+
+    def __repr__(self):
+        return (
+            f"ImportResult(imported={self.imported}, "
+            f"skipped={self.skipped}, considered={self.considered})"
+        )
+
+
+def _same_file(source_path, dest_path):
+    """Check if source and destination paths resolve to the same filesystem object."""
+    src = Path(source_path)
+    dst = Path(dest_path)
+    try:
+        if src.exists() and dst.exists():
+            return src.samefile(dst)
+    except OSError:
+        pass
+    return src.resolve() == dst.resolve()
+
+
+def import_grades_csv(source_path, dest_path=DEFAULT_DATA_PATH, on_conflict="error"):
+    """Import valid grade records from source_path CSV into dest_path CSV.
+
+    Parameters:
+        source_path: Path to the source CSV to import records from.
+        dest_path: Path to the destination grades CSV database.
+        on_conflict: Conflict resolution policy ('error' or 'skip'). Default is 'error'.
+
+    Returns:
+        ImportResult with counts of imported, skipped, and considered records.
+
+    Raises:
+        ValueError: If arguments or records are invalid or conflicts occur under 'error'.
+        FileNotFoundError: If the source CSV file does not exist.
+        PermissionError, OSError: If filesystem operations fail.
+    """
+    if on_conflict not in ("error", "skip"):
+        raise ValueError(
+            f"invalid on_conflict policy {on_conflict!r}; must be 'error' or 'skip'"
+        )
+
+    source = Path(source_path)
+    dest = Path(dest_path)
+
+    if _same_file(source, dest):
+        raise ValueError("source and destination CSV paths must not resolve to the same file")
+
+    diagnostics, valid_records, intra_duplicates = _audit_grades_csv_records(
+        source, collect_records=True
+    )
+
+    non_dup_errors = [
+        d for d in diagnostics
+        if not any(dup["diagnostic"] == d for dup in intra_duplicates)
+    ]
+    if non_dup_errors:
+        err_msg = "source CSV failed validation:\n" + "\n".join(f"  {msg}" for msg in non_dup_errors)
+        raise ValueError(err_msg)
+
+    if on_conflict == "error" and intra_duplicates:
+        dup = intra_duplicates[0]
+        rec = dup["record"]
+        raise ValueError(
+            f"source CSV contains duplicate assessment at row {dup['row_number']} "
+            f"(duplicates row {dup['first_row']}): student_id={rec['student_id']!r}, "
+            f"semester={rec['semester']!r}, subject={rec['subject']!r}, date={rec['date']!r}"
+        )
+
+    total_valid_considered = len(valid_records) + len(intra_duplicates)
+
+    lock_file = _lock_path_for(dest)
+    with _InterProcessLock(lock_file) as _lock:
+        existing_grades = load_grades(dest)
+        existing_keys = set()
+        for grade in existing_grades:
+            key = calc_assessment_key(
+                {
+                    "student_id": grade["student_id"],
+                    "semester": grade["semester"],
+                    "subject": grade["subject"],
+                    "date": grade["date"],
+                }
+            )
+            if key is not None:
+                existing_keys.add(key)
+
+        records_to_insert = []
+        skipped_dest_conflicts = 0
+
+        for item in valid_records:
+            key = item["key"]
+            rec = item["record"]
+            row_num = item["row_number"]
+
+            if key in existing_keys:
+                if on_conflict == "error":
+                    raise ValueError(
+                        f"assessment at row {row_num} already exists in destination: "
+                        f"student_id={rec['student_id']!r}, semester={rec['semester']!r}, "
+                        f"subject={rec['subject']!r}, date={rec['date']!r}"
+                    )
+                skipped_dest_conflicts += 1
+            else:
+                records_to_insert.append(rec)
+                existing_keys.add(key)
+
+        total_skipped = skipped_dest_conflicts + len(intra_duplicates)
+        total_imported = len(records_to_insert)
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        existing_rows = []
+        expected_header = [
+            "student_id", "subject", "score", "max_score", "date", "credits", "semester"
+        ]
+        if dest.exists():
+            with open(dest, mode="r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is not None and header != expected_header:
+                    raise ValueError(
+                        "grades file has an unexpected schema; refusing to rewrite "
+                        f"{dest} (expected header {expected_header!r}, got {header!r})"
+                    )
+                if header is not None:
+                    existing_rows = list(reader)
+
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(dest.parent), prefix=".grades-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(expected_header)
+                for row in existing_rows:
+                    writer.writerow(row)
+                for rec in records_to_insert:
+                    writer.writerow(
+                        [
+                            rec["student_id"],
+                            rec["subject"],
+                            rec["score"],
+                            rec["max_score"],
+                            rec["date"],
+                            rec["credits"],
+                            rec["semester"],
+                        ]
+                    )
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp_name, dest)
+            tmp_name = None
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+    return ImportResult(
+        imported=total_imported,
+        skipped=total_skipped,
+        considered=total_valid_considered,
+    )
 
 
 def cmd_validate(args):
@@ -868,6 +1069,27 @@ def cmd_validate(args):
 
     print(f"OK: {args.data} passed validation.")
     raise SystemExit(0)
+
+
+def cmd_import(args):
+    """Import grade records from a source CSV file."""
+    try:
+        result = import_grades_csv(
+            source_path=args.source,
+            dest_path=args.data,
+            on_conflict=args.on_conflict,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except OSError as exc:
+        print(f"Error: cannot read or write file: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    print(
+        f"Import completed successfully: {result.imported} record(s) imported, "
+        f"{result.skipped} record(s) skipped ({result.considered} valid record(s) considered)."
+    )
 
 
 def cmd_list(args):
@@ -1320,6 +1542,22 @@ def main():
     p_add.add_argument("semester", help="Semester number")
     p_add.set_defaults(func=cmd_add)
 
+
+    # import
+    p_import = subparsers.add_parser(
+        "import", help="Import grade records from a source CSV file"
+    )
+    p_import.add_argument(
+        "source", help="Path to the source CSV file to import"
+    )
+    p_import.add_argument(
+        "--on-conflict",
+        choices=("error", "skip"),
+        default="error",
+        help="Conflict resolution policy for duplicate assessments ('error' or 'skip', default: 'error')",
+    )
+    p_import.set_defaults(func=cmd_import)
+
     # edit
     p_edit = subparsers.add_parser(
         "edit",
@@ -1368,6 +1606,7 @@ def main():
         help="New date, YYYY-MM-DD (omit to keep the current value)",
     )
     p_edit.set_defaults(func=cmd_edit)
+
 
     # validate
     p_validate = subparsers.add_parser(
