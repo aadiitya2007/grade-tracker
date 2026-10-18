@@ -4,16 +4,13 @@ from pathlib import Path
 from grade_tracker.calc import cgpa, letter_grade, percentage, sgpa
 from html import escape
 
-# Default roster of enrolled students in the batch
-ENROLLED_STUDENTS = ["CS101", "CS102", "CS103", "CS104"]
-
-
 def get_enrolled_students(grades):
-    """Returns a sorted list of all enrolled student IDs."""
-    students = set(ENROLLED_STUDENTS)
-    for row in grades:
-        if "student_id" in row:
-            students.add(row["student_id"])
+    """Returns a sorted list of all enrolled student IDs present in grades."""
+    students = {
+        row["student_id"]
+        for row in grades
+        if row.get("student_id")
+    }
     return sorted(list(students))
 
 
