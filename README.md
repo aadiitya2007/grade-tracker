@@ -21,6 +21,7 @@ On Windows, use `python` instead of `python3`.
 | `list [--format json]` | Every mark, with its letter grade; `--format json` emits a JSON document |
 | `summary <student_id> [--format json]` | One student's marks and GPA; `--format json` emits a JSON document |
 | `explain <student_id> [--semester N] [--format json]` | Explains how assessment marks contribute to a student's SGPA and CGPA; `--format json` emits a JSON document |
+| `target-gpa <student_id> --target N --credits N [--format json]` | Calculates required SGPA in upcoming credits to achieve a target CGPA; `--format json` emits a JSON document |
 | `average <subject> [--format json]` | The class average for a subject; `--format json` emits a JSON document |
 | `add <student_id> <subject> <score> <max_score> <date> <credits> <semester> [--allow-duplicate]` | Adds a mark; opt in when recording a separate same-day assessment |
 | `edit <student_id> <semester> <subject> <date> [--score N] [--max-score N] [--credits N] [--student-id ID] [--semester N] [--subject NAME] [--date YYYY-MM-DD]` | Edits one existing mark |
@@ -104,14 +105,24 @@ python3 -m grade_tracker explain CS101 --format json
 - **Missing Students vs Missing Semesters**: A student not present in the CSV is reported as not found (`No records found for student '<id>.'`). A student who exists but has no records for the filtered semester is clearly distinguished (`No records found for student '<id>' in semester <sem>.`).
 - **Read-Only**: The command never modifies or rewrites the underlying CSV.
 
+The `target-gpa` command calculates the exact Semester Grade Point Average (SGPA) a student needs in an upcoming semester to reach a target Cumulative GPA (CGPA):
+
+```bash
+python3 -m grade_tracker target-gpa CS101 --target 9.6 --credits 10
+python3 -m grade_tracker target-gpa CS101 --target 9.6 --credits 10 --format json
+```
+
+If the requested target is mathematically impossible within the upcoming credit budget (required SGPA > 10.0), the command explains that clearly and reports the maximum possible CGPA achievable with a perfect 10.00 SGPA.
+
 ## Machine-readable JSON output
 
-The read-only commands `list`, `summary`, `explain`, `average`, and `validate` accept `--format json`. The default remains the existing human-readable text, so existing commands are unchanged. In JSON mode, stdout contains exactly one valid JSON document and nothing else; diagnostics and argparse errors go to stderr. Values that are not available are JSON `null`, not `"None"`, `"N/A"`, or similar strings. JSON output uses stable snake_case field names, arrays for collections, and JSON numbers for scores and averages.
+The read-only commands `list`, `summary`, `explain`, `target-gpa`, `average`, and `validate` accept `--format json`. The default remains the existing human-readable text, so existing commands are unchanged. In JSON mode, stdout contains exactly one valid JSON document and nothing else; diagnostics and argparse errors go to stderr. Values that are not available are JSON `null`, not `"None"`, `"N/A"`, or similar strings. JSON output uses stable snake_case field names, arrays for collections, and JSON numbers for scores and averages.
 
 ```bash
 python3 -m grade_tracker list --format json
 python3 -m grade_tracker summary CS101 --format json
 python3 -m grade_tracker explain CS101 --format json
+python3 -m grade_tracker target-gpa CS101 --target 9.6 --credits 10 --format json
 python3 -m grade_tracker average Mathematics --format json
 python3 -m grade_tracker validate --format json
 ```
