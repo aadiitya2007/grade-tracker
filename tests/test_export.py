@@ -188,3 +188,25 @@ class TestHtmlReportEscaping(unittest.TestCase):
         self.assertIn("<style>", html)
         self.assertIn("Academic Performance Report", html)
 
+    # --- 6. Regression test for Issue #26: only students present in data get cards ---
+
+    def test_export_only_includes_students_present_in_grades(self):
+        """Report must only include student IDs present in the CSV dataset."""
+        from grade_tracker.export import get_enrolled_students
+        sample = [
+            {"student_id": "CS101", "subject": "Math", "score": 90, "max_score": 100},
+            {"student_id": "CS103", "subject": "Physics", "score": 80, "max_score": 100},
+        ]
+        self.assertEqual(get_enrolled_students(sample), ["CS101", "CS103"])
+
+        self._write([
+            "CS101,Mathematics,90,100,2026-01-01,3,1\n",
+            "CS103,Physics,80,100,2026-01-01,3,1\n",
+        ])
+        html = self._build(self._load())
+        self.assertIn("Student: CS101", html)
+        self.assertIn("Student: CS103", html)
+        self.assertNotIn("Student: CS104", html)
+        self.assertNotIn("Student: CS102", html)
+
+
