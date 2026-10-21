@@ -17,6 +17,7 @@ from pathlib import Path
 from grade_tracker.calc import (
     assessment_key as calc_assessment_key,
     assessment_record_key as calc_assessment_record_key,
+    calculate_target_sgpa,
     cgpa,
     explain_student_gpa,
     letter_grade,
@@ -1624,6 +1625,108 @@ def cmd_explain(args):
     print("=" * 60)
 
 
+def cmd_target_gpa(args):
+    """Calculate required SGPA in upcoming credits to achieve a target CGPA."""
+    target_cgpa = args.target
+    upcoming_credits = args.credits
+
+    # Validate target and credits bounds
+    if not (0.0 <= target_cgpa <= 10.0):
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                {
+                    "command": "target-gpa",
+                    "student_id": args.student_id,
+                    "error": {
+                        "code": "invalid_argument",
+                        "message": "Target CGPA must be between 0.0 and 10.0.",
+                    },
+                }
+            )
+        else:
+            print("Error: target CGPA must be between 0.0 and 10.0.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if upcoming_credits <= 0.0:
+        if _format_name(args) == JSON_FORMAT:
+            _emit_json(
+                {
+                    "command": "target-gpa",
+                    "student_id": args.student_id,
+                    "error": {
+                        "code": "invalid_argument",
+                        "message": "Upcoming credits must be greater than 0.",
+                    },
+                }
+            )
+        else:
+            print("Error: upcoming credits must be greater than 0.", file=sys.stderr)
+        raise SystemExit(1)
+
+    if _format_name(args) == JSON_FORMAT:
+        try:
+            grades = _load_grades_for_json(args.data, "target-gpa")
+        except ValueError as exc:
+            payload = _json_input_error(exc)
+            payload["command"] = "target-gpa"
+            payload["student_id"] = args.student_id
+            _emit_json(payload)
+            raise SystemExit(2) from exc
+
+        student_records = [g for g in grades if g.get("student_id") == args.student_id]
+        if not student_records:
+            _emit_json(
+                {
+                    "command": "target-gpa",
+                    "student_id": args.student_id,
+                    "error": {
+                        "code": "student_not_found",
+                        "message": f"Student '{args.student_id}' does not exist.",
+                    },
+                }
+            )
+            raise SystemExit(1)
+
+        res = calculate_target_sgpa(grades, args.student_id, target_cgpa, upcoming_credits)
+        _emit_json(
+            {
+                "command": "target-gpa",
+                "student_id": res["student_id"],
+                "current_cgpa": res["current_cgpa"],
+                "current_credits": res["current_credits"],
+                "target_cgpa": res["target_cgpa"],
+                "upcoming_credits": res["upcoming_credits"],
+                "total_future_credits": res["total_future_credits"],
+                "required_sgpa": res["required_sgpa"],
+                "is_achievable": res["is_achievable"],
+                "max_possible_cgpa": res["max_possible_cgpa"],
+            }
+        )
+        return
+
+    grades = load_grades(args.data)
+    student_records = [g for g in grades if g.get("student_id") == args.student_id]
+    if not student_records:
+        print(f"Error: student '{args.student_id}' does not exist.", file=sys.stderr)
+        raise SystemExit(1)
+
+    res = calculate_target_sgpa(grades, args.student_id, target_cgpa, upcoming_credits)
+    curr_cgpa_str = f"{res['current_cgpa']:.2f}" if res["current_cgpa"] is not None else "N/A"
+    print(f"Student: {res['student_id']}")
+    print(f"Current CGPA: {curr_cgpa_str} (over {res['current_credits']:.1f} credits)")
+    print(f"Target CGPA:  {res['target_cgpa']:.2f}")
+    print(f"Upcoming:     {res['upcoming_credits']:.1f} credits")
+    print()
+    if res["is_achievable"]:
+        print("Result: Achievable")
+        print(f"Required SGPA: {res['required_sgpa']:.2f}")
+    else:
+        print("Result: Unachievable in the upcoming semester")
+        print(
+            f"Maximum achievable CGPA: {res['max_possible_cgpa']:.2f} (with a perfect 10.00 SGPA)"
+        )
+
+
 def cmd_average(args):
     if _format_name(args) == JSON_FORMAT:
         try:
@@ -2066,6 +2169,21 @@ def main():
     p_explain.add_argument("--semester", default=None, help="Filter by semester")
     _add_format_argument(p_explain)
     p_explain.set_defaults(func=cmd_explain)
+
+    # target-gpa
+    p_target = subparsers.add_parser("target-gpa", help="Calculate required SGPA for a target CGPA")
+    p_target.add_argument("student_id", help="Student ID")
+    p_target.add_argument("--target", type=float, required=True, help="Target CGPA (0.0 to 10.0)")
+    p_target.add_argument("--credits", type=float, required=True, help="Upcoming semester credits (> 0)")
+    _add_format_argument(p_target)
+    p_target.add_argument(
+        "--json",
+        action="store_const",
+        const=JSON_FORMAT,
+        dest="format",
+        help="Output JSON (shorthand for --format json)",
+    )
+    p_target.set_defaults(func=cmd_target_gpa)
 
     # average
     p_avg = subparsers.add_parser("average", help="Show average for a subject")
